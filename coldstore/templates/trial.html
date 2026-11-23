@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>峰段转移试算 · 冷库 A/B 策略</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <h1>峰段转移试算（B 策略替换 A 电量）</h1>
+  <p class="sub">UTC 整分钟 · 计费时段含起点、不含终点 · 时长 15 分钟至 24 小时 · 试算只读，不写回原数据</p>
+</header>
+
+<main>
+  <nav class="topnav">
+    <a href="{{ url_for('index') }}">← 返回总览 / 导入 / 更正</a>
+  </nav>
+
+  {% if error %}
+    <div class="flashes"><div class="flash error">试算失败：{{ error }}</div></div>
+  {% endif %}
+
+  <section class="card">
+    <h2>试算参数</h2>
+    {% if data.rounds %}
+      <form method="post" action="{{ url_for('trial_run') }}" class="trial-form">
+        <div class="grid">
+          <label>轮次
+            <select name="round_id" required>
+              <option value="">请选择…</option>
+              {% for r in data.rounds %}
+                <option value="{{ r.round_id }}" {{ 'selected' if form.round_id == r.round_id }}>
+                  {{ r.round_id }}（A [{{ r.a_start }}, {{ r.a_end }})，有效对 {{ r.valid_pairs if r.valid_pairs is not none else 0 }}）
+                </option>
+              {% endfor %}
+            </select>
+          </label>
+          <label>计费时段起点 (UTC，含)
+            <input type="text" name="billing_start" required
+                   placeholder="2026-03-01 00:00"
+                   pattern="\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}"
+                   value="{{ form.billing_start or '' }}">
+          </label>
+          <label>计费时段终点 (UTC，不含)
+            <input type="text" name="billing_end" required
+                   placeholder="2026-03-01 01:00"
+                   pattern="\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}"
+                   value="{{ form.billing_end or '' }}">
+          </label>
+          <label>缺测每分钟电量上限 (kWh)
+            <input type="text" name="missing_cap_kwh" required inputmode="decimal"
+                   placeholder="例如 2.0" value="{{ form.missing_cap_kwh or '' }}">
+          </label>
+        </div>
+        <p class="hint">
+          计费时段必须完整覆盖所选轮次的 A 窗。试算把时段内<strong>有效分钟对</strong>的
+          A 电量替换为 B 电量（其余分钟照旧）；缺测分钟电量在 0 与上限之间变化，
+          替换前后取同一个值。分别计算两种情形下时段内最高的连续 15 分钟平均功率（峰段可不同）。
+        </p>
+        <button type="submit">开始试算</button>
+      </form>
+    {% else %}
+      <p class="empty">还没有数据，请先到 <a href="{{ url_for('index') }}">总览页</a> 导入三份 CSV。</p>
+    {% endif %}
+  </section>
+
+  {% if trial %}
+    <section class="card" id="trial-result">
+      <h2>试算结果 · 轮次 {{ trial.round_id }}</h2>
+      <p class="mono small">
+        计费时段 [{{ trial.billing_start }}, {{ trial.billing_end }})，
+        共 {{ trial.duration_minutes }} 分钟；
+        替换 {{ trial.n_replaced }} 个 A 分钟；缺测 {{ trial.n_missing }} 分钟，
+        每分钟上限 {{ '%.6f'|format(trial.missing_cap_kwh) }} kWh。
+      </p>
+
+      <div class="verdict verdict-{{ trial.verdict }}">
+        <strong>结论：{{ trial.verdict_text }}</strong>
+        <div class="mono small" style="margin-top:6px">
+          需量差（替换后 − 替换前）可达范围：
+          <span class="{{ 'neg' if trial.diff_max_kw < 0 else '' }}">{{ '%.6f'|format(trial.diff_min_kw) }}</span>
+          ～
+          <span class="{{ 'pos' if trial.diff_max_kw > 0 else '' }}">{{ '%.6f'|format(trial.diff_max_kw) }}</span> kW
+          （上界 ≤ 0 即确定降峰）
+        </div>
+      </div>
+
+      <h3>参照情形：缺测全部取 0</h3>
+      <table class="trialtable">
+        <thead><tr><th>情形</th><th>峰值平均功率 (kW)</th><th>峰段（连续 15 分钟，左闭右开）</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>替换前（现状）</td>
+            <td class="mono">{{ '%.6f'|format(trial.peak_before_at_zero.mean_power_kw) }}</td>
+            <td class="mono">[{{ trial.peak_before_at_zero.start }}, {{ trial.peak_before_at_zero.end }})</td>
+          </tr>
+          <tr>
+            <td>替换后（B 替换 A）</td>
+            <td class="mono">{{ '%.6f'|format(trial.peak_after_at_zero.mean_power_kw) }}</td>
+            <td class="mono">[{{ trial.peak_after_at_zero.start }}, {{ trial.peak_after_at_zero.end }})</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>参照情形：缺测全部取上限 {{ '%.6f'|format(trial.missing_cap_kwh) }} kWh/分钟</h3>
+      <table class="trialtable">
+        <thead><tr><th>情形</th><th>峰值平均功率 (kW)</th><th>峰段（连续 15 分钟，左闭右开）</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>替换前（现状）</td>
+            <td class="mono">{{ '%.6f'|format(trial.peak_before_at_cap.mean_power_kw) }}</td>
+            <td class="mono">[{{ trial.peak_before_at_cap.start }}, {{ trial.peak_before_at_cap.end }})</td>
+          </tr>
+          <tr>
+            <td>替换后（B 替换 A）</td>
+            <td class="mono">{{ '%.6f'|format(trial.peak_after_at_cap.mean_power_kw) }}</td>
+            <td class="mono">[{{ trial.peak_after_at_cap.start }}, {{ trial.peak_after_at_cap.end }})</td>
+          </tr>
+        </tbody>
+      </table>
+
+      {% if trial.witness %}
+        <h3>⚠ 会抬高需量的缺测取值（请值班员补查这些分钟）</h3>
+        <p class="hint">
+          下列取值下需量差为
+          <span class="pos mono">{{ '%.6f'|format(trial.witness.demand_diff_kw) }}</span> kW
+          （&gt; 0，替换反而抬高峰值）。
+        </p>
+        <table class="trialtable">
+          <thead><tr><th>情形</th><th>峰值平均功率 (kW)</th><th>峰段</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>替换前峰段</td>
+              <td class="mono">{{ '%.6f'|format(trial.witness.peak_before.mean_power_kw) }}</td>
+              <td class="mono">[{{ trial.witness.peak_before.start }}, {{ trial.witness.peak_before.end }})</td>
+            </tr>
+            <tr>
+              <td>替换后峰段</td>
+              <td class="mono">{{ '%.6f'|format(trial.witness.peak_after.mean_power_kw) }}</td>
+              <td class="mono">[{{ trial.witness.peak_after.start }}, {{ trial.witness.peak_after.end }})</td>
+            </tr>
+          </tbody>
+        </table>
+        <details>
+          <summary>缺测分钟取值（{{ trial.witness.assignments|length }} 个）</summary>
+          <table class="trialtable">
+            <thead><tr><th>缺测分钟 (UTC)</th><th>取值 (kWh)</th><th>是否取上限</th></tr></thead>
+            <tbody>
+            {% for a in trial.witness.assignments %}
+              <tr>
+                <td class="mono">{{ a.minute }}</td>
+                <td class="mono">{{ '%.6f'|format(a.kwh) }}</td>
+                <td>{{ '是' if a.at_cap else '否（取 0）' }}</td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </details>
+      {% else %}
+        <p class="hint">上界 ≤ 0：不存在会抬高需量的缺测取值，无需补查。</p>
+      {% endif %}
+
+      <details>
+        <summary>替换明细（{{ trial.replacements|length }} 个有效对，Δ = B − A kWh/分钟）</summary>
+        <table class="trialtable">
+          <thead><tr><th>A 分钟</th><th>原 A 电量</th><th>替换为 B 电量</th><th>Δ</th></tr></thead>
+          <tbody>
+          {% for r in trial.replacements %}
+            <tr>
+              <td class="mono">{{ r.minute }}</td>
+              <td class="mono">{{ '%.6f'|format(r.a_kwh) }}</td>
+              <td class="mono">{{ '%.6f'|format(r.b_kwh) }}</td>
+              <td class="mono {{ 'pos' if r.delta_kwh > 0 else ('neg' if r.delta_kwh < 0 else '') }}">{{ '%.6f'|format(r.delta_kwh) }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </details>
+
+      {% if trial.missing_minutes %}
+        <details>
+          <summary>计费时段内缺测分钟（{{ trial.missing_minutes|length }} 个）</summary>
+          <p class="mono small">{{ trial.missing_minutes|join('，') }}</p>
+        </details>
+      {% endif %}
+    </section>
+  {% endif %}
+</main>
+
+<footer>
+  <p>
+    API：<code>POST /api/trials</code>（JSON：round_id / billing_start / billing_end / missing_cap_kwh） ·
+    <a href="{{ url_for('healthz') }}">健康检查</a> ·
+    试算不写回 readings / switches / results，也不写操作日志
+  </p>
+</footer>
+</body>
+</html>

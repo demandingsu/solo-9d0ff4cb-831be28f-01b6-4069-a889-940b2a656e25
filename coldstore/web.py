@@ -130,6 +130,68 @@ def create_app(
     def api_summary():
         return jsonify(store.summary(get_db()))
 
+    def _run_trial_payload(payload) -> tuple[dict | None, str | None]:
+        round_id = str(payload.get("round_id") or "").strip()
+        start = str(payload.get("billing_start") or "").strip()
+        end = str(payload.get("billing_end") or "").strip()
+        cap_raw = payload.get("missing_cap_kwh")
+        cap = str(cap_raw).strip() if cap_raw is not None else ""
+        if not round_id:
+            return None, "请选择要试算的轮次"
+        try:
+            result = store.trial_from_store(get_db(), round_id, start, end, cap)
+        except ValidationError as exc:
+            return None, str(exc)
+        return result.as_dict(), None
+
+    @app.get("/trial")
+    def trial_page():
+        db = get_db()
+        data = store.summary(db)
+        return render_template(
+            "trial.html",
+            data=data,
+            form={},
+            trial=None,
+            error=None,
+        )
+
+    @app.post("/trial")
+    def trial_run():
+        db = get_db()
+        data = store.summary(db)
+        form = {
+            "round_id": (request.form.get("round_id") or "").strip(),
+            "billing_start": (request.form.get("billing_start") or "").strip(),
+            "billing_end": (request.form.get("billing_end") or "").strip(),
+            "missing_cap_kwh": (request.form.get("missing_cap_kwh") or "").strip(),
+        }
+        try:
+            result = store.trial_from_store(
+                db,
+                form["round_id"],
+                form["billing_start"],
+                form["billing_end"],
+                form["missing_cap_kwh"],
+            )
+        except ValidationError as exc:
+            return render_template(
+                "trial.html", data=data, form=form, trial=None, error=str(exc)
+            ), 400
+        return render_template(
+            "trial.html", data=data, form=form, trial=result.as_dict(), error=None
+        )
+
+    @app.post("/api/trials")
+    def api_trial():
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"error": "请求体必须是 JSON 对象"}), 400
+        result, error = _run_trial_payload(payload)
+        if error is not None:
+            return jsonify({"error": error}), 400
+        return jsonify(result)
+
     @app.get("/api/rounds/<round_id>/pairs")
     def api_pairs(round_id: str):
         db = get_db()

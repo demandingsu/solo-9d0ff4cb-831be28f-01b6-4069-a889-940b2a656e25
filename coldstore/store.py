@@ -21,6 +21,7 @@ from typing import Iterable, Sequence
 
 from .analysis import (
     MIN_RUN_MINUTES,
+    PairResult,
     RoundPlan,
     SwitchRecord,
     ValidationError,
@@ -31,6 +32,7 @@ from .analysis import (
     parse_strategy,
     parse_ts,
 )
+from .trial import TrialResult, parse_billing_window, parse_cap, run_trial
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS rounds (
@@ -571,3 +573,68 @@ def summary(conn: sqlite3.Connection) -> dict:
         "min_run_minutes": MIN_RUN_MINUTES,
         "reason_labels": REASON_LABELS,
     }
+
+
+# ---------------------------------------------------------------------------
+# 峰段转移试算（只读：不写回任何数据表，也不写 audit_log）
+# ---------------------------------------------------------------------------
+
+
+def trial_from_store(
+    conn: sqlite3.Connection,
+    round_id: str,
+    billing_start: str,
+    billing_end: str,
+    missing_cap_kwh: str | float,
+) -> TrialResult:
+    """基于当前已提交状态的配对缓存与读数做一次试算。
+
+    配对直接取自 ``result_pairs``（即最近一次导入/更正提交后的结果），读数取自
+    ``readings``；切换更正重算后再试算自然使用更新后的配对。整个过程只读。
+    """
+    row = conn.execute(
+        "SELECT * FROM rounds WHERE round_id = ?", (round_id,)
+    ).fetchone()
+    if row is None:
+        raise ValidationError(f"轮次 {round_id!r} 不存在")
+    plan = RoundPlan(
+        row["round_id"], row["a_start"], row["a_end"], row["b_start"], row["b_end"]
+    )
+    start, end, _n = parse_billing_window(billing_start, billing_end)
+    cap = parse_cap(missing_cap_kwh)
+
+    pair_rows = conn.execute(
+        "SELECT * FROM result_pairs WHERE round_id = ? ORDER BY offset", (round_id,)
+    ).fetchall()
+    if not pair_rows:
+        raise ValidationError(
+            f"轮次 {round_id} 还没有配对结果，请先导入数据或等待重算完成"
+        )
+    pairs = [
+        PairResult(
+            offset=r["offset"],
+            a_minute=r["a_minute"],
+            b_minute=r["b_minute"],
+            a_kwh=r["a_kwh"],
+            b_kwh=r["b_kwh"],
+            included=bool(r["included"]),
+            reasons=json.loads(r["reasons_json"]),
+        )
+        for r in pair_rows
+    ]
+    valid = sum(1 for p in pairs if p.included)
+    result_row = conn.execute(
+        "SELECT * FROM results WHERE round_id = ?", (round_id,)
+    ).fetchone()
+    from .analysis import RoundResult
+
+    round_result = RoundResult(
+        round_id=round_id,
+        plan=plan,
+        pairs=pairs,
+        valid_pairs=valid,
+        mean_diff_kwh=result_row["mean_diff_kwh"] if result_row else None,
+        comparable=bool(result_row["comparable"]) if result_row else valid > 0,
+    )
+    readings = load_readings(conn)
+    return run_trial(plan, round_result, readings, start, end, cap)

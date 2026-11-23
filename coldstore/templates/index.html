@@ -42,6 +42,11 @@
 
   <section class="card">
     <h2>2. 逐轮结果</h2>
+    <p class="hint">
+      想评估 B 策略能否压低计费时段峰值需量？
+      <a class="button-link" href="{{ url_for('trial_page') }}">前往峰段转移试算 →</a>
+      （选轮次 + 填覆盖整个 A 窗的计费时段，给出需量差上下界与缺测补查清单，试算不写回数据）
+    </p>
     {% if data.rounds %}
       <div class="overview">
         共 {{ data.n_rounds }} 轮；可比较 {{ data.n_comparable }} 轮，不可比较 {{ data.n_incomparable }} 轮；
