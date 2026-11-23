@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>冷库 A/B 除霜策略耗电对比</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <h1>冷库 A/B 除霜策略耗电对比</h1>
+  <p class="sub">UTC 整分钟 · 窗含起点、到终点即止 · 每侧须按计划策略连续运行满 {{ data.min_run_minutes }} 分钟 · 差值 = B − A</p>
+</header>
+
+<main>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <div class="flashes">
+      {% for category, message in messages %}
+        <div class="flash {{ category }}">{{ message }}</div>
+      {% endfor %}
+      </div>
+    {% endif %}
+  {% endwith %}
+
+  <section class="card">
+    <h2>1. 导入三份 CSV</h2>
+    <form method="post" action="{{ url_for('import_csv') }}" enctype="multipart/form-data">
+      <div class="grid">
+        <label>轮次计划 <input type="file" name="rounds" accept=".csv" required></label>
+        <label>实际切换记录 <input type="file" name="switches" accept=".csv" required></label>
+        <label>每分钟用电量 <input type="file" name="readings" accept=".csv" required></label>
+      </div>
+      <p class="hint">
+        轮次计划列：<code>round_id,a_start,a_end,b_start,b_end</code>；
+        切换记录列：<code>switched_at,strategy,round_id</code>（round_id 可留空表示对全部轮次生效）；
+        用电量列：<code>minute,kwh</code>。导入为全量替换，失败则整体回滚。
+      </p>
+      <button type="submit">导入并计算</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>2. 逐轮结果</h2>
+    {% if data.rounds %}
+      <div class="overview">
+        共 {{ data.n_rounds }} 轮；可比较 {{ data.n_comparable }} 轮，不可比较 {{ data.n_incomparable }} 轮；
+        {% if data.overall_mean_diff_kwh is not none %}
+          可比轮 B−A 平均 {{ '%.6f'|format(data.overall_mean_diff_kwh) }} kWh/分钟
+          <span class="hint">（各轮平均值的简单平均，仅作参考）</span>
+        {% else %}
+          暂无可比较轮次，无总体平均
+        {% endif %}
+      </div>
+      <table class="rounds">
+        <thead>
+          <tr>
+            <th>轮次</th><th>A 窗</th><th>B 窗</th><th>窗长</th>
+            <th>有效对</th><th>B−A 平均 (kWh/分钟)</th><th>状态</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for r in data.rounds %}
+          <tr class="{{ 'incomparable' if not r.comparable else '' }}">
+            <td><a href="#round-{{ r.round_id }}">{{ r.round_id }}</a></td>
+            <td class="mono">[{{ r.a_start }}, {{ r.a_end }})</td>
+            <td class="mono">[{{ r.b_start }}, {{ r.b_end }})</td>
+            <td>{{ r.length_minutes }} 分钟</td>
+            <td>{{ r.valid_pairs if r.valid_pairs is not none else '—' }}</td>
+            <td class="mono">{{ '%.6f'|format(r.mean_diff_kwh) if r.mean_diff_kwh is not none else '—' }}</td>
+            <td>
+              {% if r.comparable %}
+                <span class="badge ok">可比较</span>
+              {% else %}
+                <span class="badge bad">不可比较</span>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty">还没有数据，请先导入三份 CSV。</p>
+    {% endif %}
+  </section>
+
+  {% for r in data.rounds %}
+    {% set pairs = pairs_by_round[r.round_id] %}
+    <section class="card round" id="round-{{ r.round_id }}">
+      <h3>
+        轮次 {{ r.round_id }}
+        {% if r.comparable %}<span class="badge ok">可比较</span>
+        {% else %}<span class="badge bad">不可比较</span>{% endif %}
+      </h3>
+      <p class="mono small">
+        A [{{ r.a_start }}, {{ r.a_end }}) · B [{{ r.b_start }}, {{ r.b_end }}) ·
+        有效对 {{ r.valid_pairs if r.valid_pairs is not none else 0 }} ·
+        B−A 平均 {{ '%.6f'|format(r.mean_diff_kwh) if r.mean_diff_kwh is not none else '—' }} kWh/分钟
+      </p>
+      {% if pairs %}
+        <details>
+          <summary>配对明细（{{ pairs|length }} 对，有效 {{ pairs|selectattr('included')|list|length }} 对）</summary>
+          <table class="pairs">
+            <thead>
+              <tr>
+                <th>偏移</th><th>A 分钟</th><th>A 读数</th>
+                <th>B 分钟</th><th>B 读数</th><th>B−A</th><th>是否纳入</th><th>剔除原因</th>
+              </tr>
+            </thead>
+            <tbody>
+            {% for p in pairs %}
+              <tr class="{{ 'excluded' if not p.included else '' }}">
+                <td>{{ p.offset }}</td>
+                <td class="mono">{{ p.a_minute }}</td>
+                <td class="mono">{{ '%.6f'|format(p.a_kwh) if p.a_kwh is not none else '—' }}</td>
+                <td class="mono">{{ p.b_minute }}</td>
+                <td class="mono">{{ '%.6f'|format(p.b_kwh) if p.b_kwh is not none else '—' }}</td>
+                <td class="mono">{{ '%.6f'|format(p.diff_kwh) if p.diff_kwh is not none else '—' }}</td>
+                <td>{{ '是' if p.included else '否' }}</td>
+                <td class="reasons">
+                  {% for reason in p.reason_texts %}
+                    <span class="reason">{{ reason }}</span>
+                  {% endfor %}
+                </td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </details>
+      {% else %}
+        <p class="empty">该轮还没有计算结果（请重新导入）。</p>
+      {% endif %}
+    </section>
+  {% endfor %}
+
+  <section class="card">
+    <h2>3. 切换记录与更正</h2>
+    {% if switches %}
+      <table class="switches">
+        <thead>
+          <tr><th>#</th><th>生效时刻 (UTC)</th><th>策略</th><th>作用轮次</th><th>来源</th><th>更正</th></tr>
+        </thead>
+        <tbody>
+        {% for s in switches %}
+          <tr>
+            <td>{{ s.id }}</td>
+            <td class="mono">{{ s.at }}</td>
+            <td>{{ s.strategy }}</td>
+            <td>{{ s.round_id or '全部' }}</td>
+            <td>{{ '导入' if s.source == 'import' else '手工更正' }}</td>
+            <td>
+              <form method="post" action="{{ url_for('correct', switch_id=s.id) }}" class="inline">
+                <input type="text" name="new_at" value="{{ s.at }}" size="16"
+                       pattern="\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}" required>
+                <select name="new_strategy">
+                  <option value="A" {{ 'selected' if s.strategy == 'A' }}>A</option>
+                  <option value="B" {{ 'selected' if s.strategy == 'B' }}>B</option>
+                </select>
+                <select name="new_round_id">
+                  <option value="" {{ 'selected' if not s.round_id }}>全部轮次</option>
+                  {% for r in data.rounds %}
+                    <option value="{{ r.round_id }}" {{ 'selected' if s.round_id == r.round_id }}>{{ r.round_id }}</option>
+                  {% endfor %}
+                </select>
+                <button type="submit">更正并重算</button>
+              </form>
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      <p class="hint">
+        更正后只重算受影响的轮次：窗内逐分钟的实际策略或“是否已连续运行满
+        {{ data.min_run_minutes }} 分钟”有任何变化就会重算，即使切换时刻在窗外。
+      </p>
+    {% else %}
+      <p class="empty">还没有切换记录。</p>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>4. 操作日志</h2>
+    {% if audit %}
+      <table class="audit">
+        <thead><tr><th>时间</th><th>动作</th><th>说明</th></tr></thead>
+        <tbody>
+        {% for a in audit %}
+          <tr><td class="mono">{{ a.at }}</td><td>{{ a.action }}</td><td>{{ a.detail }}</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty">暂无操作记录。</p>
+    {% endif %}
+  </section>
+</main>
+
+<footer>
+  <p>
+    API: <a href="{{ url_for('api_summary') }}">/api/summary</a> ·
+    健康检查 <a href="{{ url_for('healthz') }}">/healthz</a> ·
+    数据表：轮次计划、切换记录、分钟读数、逐对结果（SQLite）
+  </p>
+</footer>
+</body>
+</html>
